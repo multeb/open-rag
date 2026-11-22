@@ -52,7 +52,8 @@ def calendar_anchors(now: datetime) -> str:
     for a small context window, but its shape was chosen by replaying the
     prompt against the deployment's LLM, not by taste: one anchor per line
     with "last X" listed before "this X" (two per line, or "this" first, made
-    the model answer "last week" with the current week's range), and the
+    the model answer "last week" with the current week's range; the template's
+    own resolution rule must name them in that order too), and the
     closing formula line (without it the model returned no filter at all for
     an explicit month such as "January 2024", as if only listed periods were
     filterable). Dropping the year anchors cost accuracy on the English "last
@@ -84,7 +85,7 @@ def calendar_anchors(now: datetime) -> str:
         f"- this month [{this_month}, {next_month})\n"
         f"- last year [{last_year}, {this_year})\n"
         f"- this year [{this_year}, {next_year})\n"
-        f"- recent / latest (past {RECENT_DAYS} days) [{recent_start}, {tomorrow})\n"
+        f"- recent / lately (past {RECENT_DAYS} days) [{recent_start}, {tomorrow})\n"
         # One worked instance of the formula: without it the model resolved
         # "past 2 weeks" to a 17-day window in both languages. Labelled as an
         # example, otherwise "past 3 weeks" copies this range instead of

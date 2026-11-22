@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode, urlparse
 
 from core.models.user import OIDCSession, PartitionRole, User, UserPartition
+from core.utils.consts import is_reserved_partition_name
 from core.utils.exceptions import AuthError, OpenRAGError
 from core.utils.logging import get_logger, mask_email
 from services.auth import (
@@ -366,6 +367,7 @@ class AuthService:
 
     async def list_user_partitions_for_request(self, user_id: int) -> list[dict[str, Any]]:
         memberships = await self._membership_repo.list_user_partitions(user_id)
+        # Reserved names are never memberships.
         return [
             {
                 "partition": membership.partition,
@@ -373,6 +375,7 @@ class AuthService:
                 "created_at": membership.added_at.isoformat() if membership.added_at else None,
             }
             for membership in memberships
+            if not is_reserved_partition_name(membership.partition)
         ]
 
     async def get_oidc_session_by_token_for_request(self, token: str) -> dict[str, Any] | None:
@@ -691,10 +694,17 @@ class AuthService:
         return mapping
 
     async def _resolve_user(self, sub: str, claims: dict[str, Any]) -> User:
-        """Look the user up by ``sub``; auto-provision if configured."""
+        """Look the user up by ``sub``; auto-provision if configured.
+
+        An account provisioned from ``auth.seed_users`` is refused: its
+        external_user_id is an operator-chosen key, not an IdP ``sub``, and a
+        login on it would hand the IdP its profile, memberships and possibly
+        admin rights. Raised here, before any profile sync, claim mapping or
+        group sync writes to it.
+        """
         user = await self._user_repo.get_user_by_external_id(sub)
         if user is not None:
-            return user
+            return self._refuse_managed(user)
 
         if not self._config.auto_provision_login:
             logger.warning(f"OIDC login rejected — user not registered (sub={sub!r})")
@@ -717,23 +727,34 @@ class AuthService:
             # actionable conflict instead of an opaque 500.
             logger.exception(f"OIDC auto-provisioning failed for sub={sub!r}: {e}")
             user = await self._user_repo.get_user_by_external_id(sub)
-            if user is None:
-                if isinstance(email, str) and email.strip():
-                    existing = await self._user_repo.get_user_by_email(email)
-                    if existing is not None:
-                        logger.error(
-                            f"OIDC auto-provisioning blocked for sub={sub!r}: an account with email "
-                            f"{mask_email(email)} already exists under a different identity. Set that "
-                            f"user's external_user_id to this sub to allow login."
-                        )
-                        raise OIDCFlowError(
-                            "An account with this email already exists. Ask your administrator to "
-                            "link it to your identity provider login.",
-                            status_code=409,
-                        ) from e
-                raise OIDCFlowError("Failed to provision user", status_code=500) from e
+            if user is not None:
+                return self._refuse_managed(user)
+            if isinstance(email, str) and email.strip():
+                existing = await self._user_repo.get_user_by_email(email)
+                if existing is not None:
+                    logger.error(
+                        f"OIDC auto-provisioning blocked for sub={sub!r}: an account with email "
+                        f"{mask_email(email)} already exists under a different identity. Set that "
+                        f"user's external_user_id to this sub to allow login."
+                    )
+                    raise OIDCFlowError(
+                        "An account with this email already exists. Ask your administrator to "
+                        "link it to your identity provider login.",
+                        status_code=409,
+                    ) from e
+            raise OIDCFlowError("Failed to provision user", status_code=500) from e
         else:
             logger.info(f"OIDC user auto-provisioned (id={user.id}, sub={sub!r})")
+        return user
+
+    @staticmethod
+    def _refuse_managed(user: User) -> User:
+        """Return ``user``, or raise a 403 if it is managed by ``auth.seed_users``."""
+        if user.managed_by_config:
+            logger.bind(user_id=user.id).warning(
+                "OIDC login rejected: the matching account is managed by auth.seed_users"
+            )
+            raise OIDCFlowError("User not allowed to log in through the identity provider", status_code=403)
         return user
 
     async def _sync_auto_provisioned(

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from core.config.model_endpoints import embedder_fingerprint
-from core.utils.consts import strip_protected_metadata
+from core.utils.consts import is_reserved_partition_name, strip_protected_metadata
 from core.utils.exceptions import AuthError, ConfigError, PartitionNotFoundError, ValidationError
 from core.utils.filename import extract_temporal_fields
 from core.utils.logging import get_logger
@@ -55,6 +55,20 @@ def _human_readable_size(size_bytes: int) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024
     return f"{size:.2f} PB"
+
+
+def _refuse_reserved_partition(partition: str) -> None:
+    """Refuse to change or copy a file in a partition named like the `all` wildcard.
+
+    The vector store reads that name as every partition, so deleting, updating
+    or copying file X there would reach file X in every partition.
+    """
+    if is_reserved_partition_name(partition):
+        raise ValidationError(
+            f"Partition name '{partition}' is reserved.",
+            status_code=400,
+            code="RESERVED_PARTITION_NAME",
+        )
 
 
 def _sha256_file(path: str) -> str:
@@ -150,6 +164,29 @@ class IndexingService:
             and getattr(getattr(self._config, "loader", None), "content_deduplication_enabled", False)
         )
 
+    async def _ensure_no_embedder_swap(self, partition: str) -> None:
+        ensure = getattr(self._partition_service, "ensure_no_embedder_swap", None)
+        if ensure is not None:
+            await ensure(partition)
+
+    @asynccontextmanager
+    async def _embedder_swap_fence(self, partition: str) -> AsyncIterator[None]:
+        """Refuse a chunk rewrite while *partition*'s embedder is being swapped.
+
+        Held for the whole write, not just the check: a metadata update reads
+        whole rows and writes them back, so one interleaving with a swap's
+        partial writes would put the old, empty field back over new vectors.
+        A swap starts under the same fence.
+        """
+        lock = getattr(self._partition_service, "operation_lock", None)
+        if lock is None:
+            await self._ensure_no_embedder_swap(partition)
+            yield
+            return
+        async with lock(partition):
+            await self._ensure_no_embedder_swap(partition)
+            yield
+
     @asynccontextmanager
     async def _partition_admission(self, partition: str) -> AsyncIterator[bool]:
         if self._partition_service is None:
@@ -188,6 +225,11 @@ class IndexingService:
     def _resolve_indexation_dispatch_config(self, partition: str) -> tuple[dict | None, str | None]:
         partitions = self._partition_configs()
         if not partitions:
+            # Legacy passthrough: the worker indexes with its static config and
+            # the default embedder. A running service never has an empty cache
+            # (startup seeds the undeletable ``default`` partition and loads
+            # it); only unit tests that build the service without partitions,
+            # or a partition table emptied by hand in the database, land here.
             return None, None
         if partition not in partitions:
             raise PartitionNotFoundError(f"Partition '{partition}' does not exist.")
@@ -285,6 +327,7 @@ class IndexingService:
             content_sha256=content_sha256,
         )
         async with self._partition_admission(partition) as partition_existed_at_admission:
+            await self._ensure_no_embedder_swap(partition)
             await self._ensure_partition_exists(partition, user)
             await self._refresh_preset_config_if_stale()
             await self._pin_partition_embedder(partition)
@@ -307,6 +350,7 @@ class IndexingService:
             )
 
     async def delete_file(self, file_id: str, partition: str) -> None:
+        _refuse_reserved_partition(partition)
         await self._dispatcher.delete_file(file_id, partition)
 
     async def update_metadata(
@@ -316,6 +360,17 @@ class IndexingService:
         partition: str,
         user: dict | None,
     ) -> None:
+        _refuse_reserved_partition(partition)
+        # The file's row stays in its partition while its chunks would be
+        # rewritten into the other one, so it would drop out of every search.
+        # A null is refused too: it would be written into every chunk.
+        if "partition" in (metadata or {}) and metadata["partition"] != partition:
+            raise ValidationError(
+                "A metadata update cannot change the partition of a file. "
+                "Copy the file to the other partition, then delete it from this one.",
+                status_code=400,
+                code="PARTITION_CHANGE_UNSUPPORTED",
+            )
         # Drop server-managed keys before they reach the store (#713). Without
         # this a partition editor could repoint ``source`` at another tenant's
         # upload under the shared data dir and read it back through
@@ -329,7 +384,8 @@ class IndexingService:
                 f"Dropped protected metadata keys from file metadata update: {dropped}"
             )
         metadata["file_id"] = file_id
-        await self._dispatcher.update_file_metadata(file_id, metadata, partition, user)
+        async with self._embedder_swap_fence(partition):
+            await self._dispatcher.update_file_metadata(file_id, metadata, partition, user)
 
     async def copy_file(
         self,
@@ -341,6 +397,8 @@ class IndexingService:
         metadata: dict,
         user: dict | None,
     ) -> None:
+        _refuse_reserved_partition(source_partition)
+        _refuse_reserved_partition(target_partition)
         # Same guard as update_metadata (#713): the copy carries caller-supplied
         # metadata onto the new rows, so a spoofed ``source`` would land there too.
         metadata, dropped = strip_protected_metadata(metadata)
@@ -357,9 +415,11 @@ class IndexingService:
         # Admitted like an upload, so a missing target is created and pinned.
         # The copy itself runs outside the fence, which uploads wait on: it can
         # re-embed for minutes. It holds the copy lock instead, taken under the
-        # fence, which keeps the target's embedder from changing meanwhile.
+        # fence, which keeps the target's embedder from changing, or a swap from
+        # starting, meanwhile.
         async with AsyncExitStack() as copying:
             async with self._partition_admission(target_partition):
+                await self._ensure_no_embedder_swap(target_partition)
                 await self._ensure_partition_exists(target_partition, user)
                 await self._refresh_preset_config_if_stale()
                 await self._pin_partition_embedder(target_partition)
