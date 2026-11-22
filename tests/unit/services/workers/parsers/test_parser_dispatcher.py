@@ -102,6 +102,7 @@ def test_resolve_backend(filename: str, content_type: DocumentType, expected_bac
 
 def test_resolve_pdf_backend_variants() -> None:
     assert ParserDispatcher(_config(pdf="DoclingLoader"))._resolve_pdf_backend() == "docling"
+    assert ParserDispatcher(_config(pdf="PyMuPDF"))._resolve_pdf_backend() == "pymupdf"
     assert ParserDispatcher(_config(pdf="PyMuPDFLoader"))._resolve_pdf_backend() == "pymupdf"
     assert ParserDispatcher(_config(pdf="DotsOCRLoader"))._resolve_pdf_backend() == "pdf_client"
 

@@ -36,6 +36,7 @@ TranscriptionEndpointResolver = Callable[[], ModelEndpointConfig | None | Awaita
 _PDF_BACKENDS: dict[str, str] = {
     "MarkerLoader": "marker",
     "DoclingLoader": "docling",
+    "PyMuPDF": "pymupdf",
     "PyMuPDFLoader": "pymupdf",
     "DotsOCRLoader": "pdf_client",
     "OpenAILoader": "pdf_client",
